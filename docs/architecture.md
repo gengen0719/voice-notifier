@@ -27,7 +27,7 @@ DynamoDB Streams を起点に配信 Lambda が通知する。クライアント�
 | 経路 | 用途 |
 | --- | --- |
 | `POST /v1/devices` | 短命の登録コードと端末が生成したトークンを受け取り、端末 ID を返す。同一の組み合わせの再送は同じ端末 ID を返す |
-| `GET /v1/audio?cursor=…` | 未処理音声を取り込み順で返す。各項目に `audioId` と `createdAt`、必要に応じて `nextCursor` |
+| `GET /v1/audio?cursor=…` | 未処理音声を取り込み順で返す。各項目に `audioId` と `createdAt`、応答に接続先 ID `sourceId` と必要に応じて `nextCursor` |
 | `POST /v1/audio/{audioId}/download` | 認可済みの音声に対して `url` と `expiresAt` を返す |
 | `PUT /v1/audio/{audioId}/played` | 端末単位で再生完了を記録。同じ完了通知は再送可能 |
 | WebSocket `$connect` | Authorization ヘッダーの端末トークンを Lambda オーソライザーで検証 |
@@ -42,7 +42,7 @@ S3 は非公開のまま維持する。署名 Lambda の S3 読み取りは対�
 
 SwiftUI の `scenePhase` が `.active` の間、`URLSessionWebSocketTask` で接続を維持する。4 分間隔のハートビート、ジッター付き指数バックオフ、前面復帰と再接続時の同期を実装する。API Gateway のアイドル上限は 10 分、接続上限は 2 時間。
 
-ローカル再生キューは音声 ID で重複を排除する。各音声は再生直前に URL を取得して一時ファイルへダウンロードし、AVFoundation で一件ずつ再生する。再生完了を端末へ保存してから API に送り、通信失敗時は再送する。再生エラーは未完了として再試行できるようにする。
+ローカル再生キューは音声 ID で重複を排除する。各音声は再生直前に URL を取得して一時ファイルへダウンロードし、AVFoundation で一件ずつ再生する。再生完了を端末と接続先ごとに保存してから API に送る。通信失敗時は、その接続先での再生を再開する前に完了を再送する。再生エラーは未完了として再試行できるようにする。
 
 ## ディレクトリと実装段階
 

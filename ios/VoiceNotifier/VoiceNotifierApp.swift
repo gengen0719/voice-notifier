@@ -26,7 +26,9 @@ struct Enrollment: Codable {
     init(http: String, socket: String, code: String) throws {
         httpURL = try NotifierAPI.endpoint(http, scheme: "https")
         socketURL = try NotifierAPI.endpoint(socket, scheme: "wss")
-        self.code = code
+        let trimmedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCode.isEmpty else { throw NotifierError.invalidCode }
+        self.code = trimmedCode
         var bytes = [UInt8](repeating: 0, count: 32)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         guard status == errSecSuccess else { throw NotifierError.keychain(status) }
@@ -35,11 +37,12 @@ struct Enrollment: Codable {
 }
 
 enum NotifierError: LocalizedError {
-    case invalidEndpoint, invalidResponse, status(Int), playback, keychain(OSStatus)
+    case invalidEndpoint, invalidCode, invalidResponse, status(Int), playback, keychain(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint: "HTTPS と WSS の API URL を確認してください。"
+        case .invalidCode: "登録コードを入力してください。"
         case .invalidResponse: "サーバーの応答を読み取れませんでした。"
         case .status(401): "端末登録の有効期限または失効状態を確認してください。"
         case .status(let code): "サーバーから HTTP \(code) が返されました。"
@@ -96,7 +99,7 @@ enum CredentialStore {
 struct NotifierAPI {
     struct Device: Decodable { let deviceId: String }
     struct Audio: Decodable { let audioId: String }
-    struct Page: Decodable { let items: [Audio]; let nextCursor: String? }
+    struct Page: Decodable { let sourceId: String; let items: [Audio] }
     struct Download: Decodable { let url: URL }
 
     let credentials: Credentials
@@ -118,13 +121,8 @@ struct NotifierAPI {
         return url
     }
 
-    private func request(_ path: String, method: String = "GET", cursor: String? = nil) -> URLRequest {
-        let base = credentials.httpURL.appending(path: path)
-        var url = base
-        if let cursor, var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) {
-            parts.queryItems = [URLQueryItem(name: "cursor", value: cursor)]
-            url = parts.url ?? base
-        }
+    private func request(_ path: String, method: String = "GET") -> URLRequest {
+        let url = credentials.httpURL.appending(path: path)
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = method
         request.setValue("Bearer " + credentials.token, forHTTPHeaderField: "Authorization")
@@ -142,8 +140,8 @@ struct NotifierAPI {
         guard (200..<300).contains(response.statusCode) else { throw NotifierError.status(response.statusCode) }
     }
 
-    func page(after cursor: String?) async throws -> Page {
-        try JSONDecoder().decode(Page.self, from: await Self.data(request("v1/audio", cursor: cursor)))
+    func page() async throws -> Page {
+        try JSONDecoder().decode(Page.self, from: await Self.data(request("v1/audio")))
     }
 
     func download(_ id: String) async throws -> URL {
@@ -225,10 +223,14 @@ final class NotifierModel: ObservableObject {
             try CredentialStore.save(result)
             credentials = result
             try clearPendingEnrollment()
-        } catch NotifierError.status(403) {
+        } catch NotifierError.status(let status) where [400, 403, 404].contains(status) {
             do {
                 try clearPendingEnrollment()
-                error = "登録コードが無効か、別の端末が登録されています。"
+                switch status {
+                case 403: error = "登録コードが無効か、別の端末が登録されています。"
+                case 404: error = "HTTP API URL に端末登録の経路が見つかりません。"
+                default: error = "登録内容を確認してください。"
+                }
             } catch { self.error = error.localizedDescription }
         } catch { self.error = error.localizedDescription }
     }
@@ -238,12 +240,21 @@ final class NotifierModel: ObservableObject {
         pendingEnrollment = nil
     }
 
+    func discardPendingEnrollment() {
+        guard !registering else { return }
+        do {
+            try clearPendingEnrollment()
+            error = nil
+        } catch { self.error = error.localizedDescription }
+    }
+
     func clearRegistration() {
         do {
             try clearPendingEnrollment()
             try CredentialStore.clear()
             if let credentials {
                 UserDefaults.standard.removeObject(forKey: pendingKey(credentials))
+                UserDefaults.standard.removeObject(forKey: pendingSourcesKey(credentials))
             }
             credentials = nil
         } catch { self.error = error.localizedDescription }
@@ -251,6 +262,10 @@ final class NotifierModel: ObservableObject {
 
     private func pendingKey(_ credentials: Credentials) -> String {
         "pending-played." + credentials.deviceId
+    }
+
+    private func pendingSourcesKey(_ credentials: Credentials) -> String {
+        "pending-played-sources." + credentials.deviceId
     }
 
     func run(_ credentials: Credentials) async {
@@ -293,19 +308,27 @@ final class NotifierModel: ObservableObject {
     }
 
     private func drain(_ api: NotifierAPI) async throws {
-        let pending = pendingKey(api.credentials)
-        if let played = UserDefaults.standard.string(forKey: pending) {
-            do {
-                try await api.acknowledge(played)
-            } catch NotifierError.status(404) {
-                // The saved acknowledgment can belong to a previously configured source.
-            }
-            UserDefaults.standard.removeObject(forKey: pending)
-        }
-        var cursor: String?
-        repeat {
+        let defaults = UserDefaults.standard
+        let legacyKey = pendingKey(api.credentials)
+        let sourcesKey = pendingSourcesKey(api.credentials)
+        while true {
             try Task.checkCancellation()
-            let page = try await api.page(after: cursor)
+            let page = try await api.page()
+            var pending = defaults.dictionary(forKey: sourcesKey) as? [String: String] ?? [:]
+            if pending[page.sourceId] == nil,
+               let legacy = defaults.string(forKey: legacyKey),
+               legacy == page.items.first?.audioId {
+                pending[page.sourceId] = legacy
+                defaults.set(pending, forKey: sourcesKey)
+                defaults.removeObject(forKey: legacyKey)
+            }
+            if let played = pending[page.sourceId] {
+                try await api.acknowledge(played)
+                pending.removeValue(forKey: page.sourceId)
+                defaults.set(pending, forKey: sourcesKey)
+                continue
+            }
+            guard !page.items.isEmpty else { return }
             for item in page.items {
                 try Task.checkCancellation()
                 playback = "ダウンロード中"
@@ -313,13 +336,14 @@ final class NotifierModel: ObservableObject {
                 defer { try? FileManager.default.removeItem(at: file) }
                 playback = "再生中"
                 try await play(file)
-                UserDefaults.standard.set(item.audioId, forKey: pending)
+                pending[page.sourceId] = item.audioId
+                defaults.set(pending, forKey: sourcesKey)
                 try await api.acknowledge(item.audioId)
-                UserDefaults.standard.removeObject(forKey: pending)
+                pending.removeValue(forKey: page.sourceId)
+                defaults.set(pending, forKey: sourcesKey)
                 error = nil
             }
-            cursor = page.nextCursor
-        } while cursor != nil
+        }
     }
 
     private func play(_ file: URL) async throws {
@@ -448,6 +472,11 @@ struct ContentView: View {
     @State private var socket = ""
     @State private var code = ""
     @State private var confirmingReset = false
+    @State private var confirmingDiscard = false
+
+    private var trimmedCode: String {
+        code.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     var body: some View {
         NavigationStack {
@@ -475,13 +504,15 @@ struct ContentView: View {
                         }
                         Button(model.registering ? "登録中…" : model.pendingEnrollment == nil ? "登録" : "前回の登録を再試行") {
                             Task {
-                                await model.register(http: http, socket: socket, code: code.trimmingCharacters(in: .whitespacesAndNewlines))
+                                await model.register(http: http, socket: socket, code: trimmedCode)
                                 if model.credentials != nil { code = "" }
                             }
                         }
-                        .disabled(model.registering || (model.pendingEnrollment == nil && (http.isEmpty || socket.isEmpty || code.isEmpty)))
+                        .disabled(model.registering || (model.pendingEnrollment == nil && (http.isEmpty || socket.isEmpty || trimmedCode.isEmpty)))
                         if let attempt = model.pendingEnrollment {
                             LabeledContent("再試行先", value: attempt.httpURL.host ?? "")
+                            Button("入力をやり直す", role: .destructive) { confirmingDiscard = true }
+                                .disabled(model.registering)
                         }
                     }
                 }
@@ -490,6 +521,11 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Voice Notifier")
+            .confirmationDialog("保留中の登録を破棄しますか？", isPresented: $confirmingDiscard) {
+                Button("破棄して入力し直す", role: .destructive) { model.discardPendingEnrollment() }
+            } message: {
+                Text("サーバーで登録済みの場合、再登録には管理者による端末の失効が必要です。")
+            }
             .confirmationDialog("このiPhoneの登録情報を消去しますか？", isPresented: $confirmingReset) {
                 Button("消去", role: .destructive) { model.clearRegistration() }
             } message: {

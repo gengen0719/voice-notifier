@@ -176,7 +176,7 @@ def http(event, _context):
         condition = Key("pk").eq(CATALOG) & Key("sk").gt(after)
         page = table.query(KeyConditionExpression=condition, Limit=25, ConsistentRead=True)
         items = [{"audioId": item["audioId"], "createdAt": item["createdAt"]} for item in page["Items"]]
-        result = {"items": items}
+        result = {"sourceId": SOURCE, "items": items}
         if "LastEvaluatedKey" in page:
             result["nextCursor"] = SOURCE + ":" + page["LastEvaluatedKey"]["sk"]
         return response(200, result)
