@@ -84,7 +84,7 @@ export class VoiceNotifierStack extends Stack {
 
     const auth = makeFunction('WebSocketAuth', 'authorize');
     const connections = makeFunction('Connections', 'connection', { WS_ENDPOINT: endpoint });
-    const delivery = makeFunction('Delivery', 'deliver', { WS_ENDPOINT: endpoint });
+    const delivery = makeFunction('Delivery', 'deliver', { ...audio, WS_ENDPOINT: endpoint });
     const admin = makeFunction('Admin', 'admin', { WS_ENDPOINT: endpoint });
     table.grantReadData(auth);
     for (const fn of [connections, delivery, admin]) {
@@ -112,7 +112,7 @@ export class VoiceNotifierStack extends Stack {
       bisectBatchOnError: true,
       onFailure: new sources.SqsDlq(failures),
       filters: [lambda.FilterCriteria.filter({ dynamodb: {
-        Keys: { pk: { S: ['AUDIO'] } },
+        Keys: { pk: { S: [{ prefix: 'AUDIO#' }] } },
       } })],
     }));
     new CfnOutput(this, 'HttpUrl', { value: http.apiEndpoint });

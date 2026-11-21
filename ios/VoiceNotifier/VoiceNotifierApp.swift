@@ -17,6 +17,23 @@ struct Credentials: Codable, Equatable {
     let token: String
 }
 
+struct Enrollment: Codable {
+    let httpURL: URL
+    let socketURL: URL
+    let code: String
+    let token: String
+
+    init(http: String, socket: String, code: String) throws {
+        httpURL = try NotifierAPI.endpoint(http, scheme: "https")
+        socketURL = try NotifierAPI.endpoint(socket, scheme: "wss")
+        self.code = code
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else { throw NotifierError.keychain(status) }
+        token = bytes.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 enum NotifierError: LocalizedError {
     case invalidEndpoint, invalidResponse, status(Int), playback, keychain(OSStatus)
 
@@ -33,30 +50,34 @@ enum NotifierError: LocalizedError {
 }
 
 enum CredentialStore {
-    static let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "voice-notifier",
-        kSecAttrAccount as String: "device",
-    ]
+    static let enrollment = "enrollment"
 
-    static func load() throws -> Credentials? {
+    private static func query(_ account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "voice-notifier",
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    static func load<T: Decodable>(_ type: T.Type, account: String = "device") throws -> T? {
         var result: CFTypeRef?
-        var request = query
+        var request = query(account)
         request[kSecReturnData as String] = true
         let status = SecItemCopyMatching(request as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else {
             throw NotifierError.keychain(status)
         }
-        return try JSONDecoder().decode(Credentials.self, from: data)
+        return try JSONDecoder().decode(type, from: data)
     }
 
-    static func save(_ credentials: Credentials) throws {
-        let data = try JSONEncoder().encode(credentials)
+    static func save<T: Encodable>(_ value: T, account: String = "device") throws {
+        let data = try JSONEncoder().encode(value)
         let update = [kSecValueData as String: data]
-        var status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        var status = SecItemUpdate(query(account) as CFDictionary, update as CFDictionary)
         if status == errSecItemNotFound {
-            var request = query
+            var request = query(account)
             request[kSecValueData as String] = data
             request[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             status = SecItemAdd(request as CFDictionary, nil)
@@ -64,8 +85,8 @@ enum CredentialStore {
         guard status == errSecSuccess else { throw NotifierError.keychain(status) }
     }
 
-    static func clear() throws {
-        let status = SecItemDelete(query as CFDictionary)
+    static func clear(account: String = "device") throws {
+        let status = SecItemDelete(query(account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw NotifierError.keychain(status)
         }
@@ -73,25 +94,23 @@ enum CredentialStore {
 }
 
 struct NotifierAPI {
-    struct Device: Decodable { let deviceId: String; let token: String }
+    struct Device: Decodable { let deviceId: String }
     struct Audio: Decodable { let audioId: String }
     struct Page: Decodable { let items: [Audio]; let nextCursor: String? }
     struct Download: Decodable { let url: URL }
 
     let credentials: Credentials
 
-    static func register(http: String, socket: String, code: String) async throws -> Credentials {
-        let httpURL = try endpoint(http, scheme: "https")
-        let socketURL = try endpoint(socket, scheme: "wss")
-        var request = URLRequest(url: httpURL.appending(path: "v1/devices"))
+    static func register(_ enrollment: Enrollment) async throws -> Credentials {
+        var request = URLRequest(url: enrollment.httpURL.appending(path: "v1/devices"), timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(["code": code])
+        request.httpBody = try JSONEncoder().encode(["code": enrollment.code, "token": enrollment.token])
         let device = try JSONDecoder().decode(Device.self, from: await data(request))
-        return Credentials(httpURL: httpURL, socketURL: socketURL, deviceId: device.deviceId, token: device.token)
+        return Credentials(httpURL: enrollment.httpURL, socketURL: enrollment.socketURL, deviceId: device.deviceId, token: enrollment.token)
     }
 
-    private static func endpoint(_ value: String, scheme: String) throws -> URL {
+    static func endpoint(_ value: String, scheme: String) throws -> URL {
         guard let parts = URLComponents(string: value.trimmingCharacters(in: .whitespacesAndNewlines)),
               parts.scheme == scheme, let host = parts.host, !host.isEmpty,
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
@@ -176,11 +195,16 @@ final class NotifierModel: ObservableObject {
     @Published private(set) var connection = "未接続"
     @Published private(set) var playback = "待機中"
     @Published private(set) var registering = false
+    @Published private(set) var pendingEnrollment: Enrollment?
     @Published var error: String?
 
     init() {
-        do { credentials = try CredentialStore.load() }
-        catch { self.error = error.localizedDescription }
+        do {
+            credentials = try CredentialStore.load(Credentials.self)
+            if credentials == nil {
+                pendingEnrollment = try CredentialStore.load(Enrollment.self, account: CredentialStore.enrollment)
+            }
+        } catch { self.error = error.localizedDescription }
     }
 
     func register(http: String, socket: String, code: String) async {
@@ -189,14 +213,34 @@ final class NotifierModel: ObservableObject {
         defer { registering = false }
         error = nil
         do {
-            let result = try await NotifierAPI.register(http: http, socket: socket, code: code)
+            let attempt: Enrollment
+            if let pendingEnrollment {
+                attempt = pendingEnrollment
+            } else {
+                attempt = try Enrollment(http: http, socket: socket, code: code)
+                try CredentialStore.save(attempt, account: CredentialStore.enrollment)
+                pendingEnrollment = attempt
+            }
+            let result = try await NotifierAPI.register(attempt)
             try CredentialStore.save(result)
             credentials = result
+            try clearPendingEnrollment()
+        } catch NotifierError.status(403) {
+            do {
+                try clearPendingEnrollment()
+                error = "登録コードが無効か、別の端末が登録されています。"
+            } catch { self.error = error.localizedDescription }
         } catch { self.error = error.localizedDescription }
+    }
+
+    private func clearPendingEnrollment() throws {
+        try CredentialStore.clear(account: CredentialStore.enrollment)
+        pendingEnrollment = nil
     }
 
     func clearRegistration() {
         do {
+            try clearPendingEnrollment()
             try CredentialStore.clear()
             if let credentials {
                 UserDefaults.standard.removeObject(forKey: pendingKey(credentials))
@@ -251,7 +295,11 @@ final class NotifierModel: ObservableObject {
     private func drain(_ api: NotifierAPI) async throws {
         let pending = pendingKey(api.credentials)
         if let played = UserDefaults.standard.string(forKey: pending) {
-            try await api.acknowledge(played)
+            do {
+                try await api.acknowledge(played)
+            } catch NotifierError.status(404) {
+                // The saved acknowledgment can belong to a previously configured source.
+            }
             UserDefaults.standard.removeObject(forKey: pending)
         }
         var cursor: String?
@@ -412,24 +460,29 @@ struct ContentView: View {
                     Button("端末登録を解除", role: .destructive) { confirmingReset = true }
                 } else {
                     Section("端末登録") {
-                        TextField("HTTP API URL", text: $http)
-                            .keyboardType(.URL)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        TextField("WebSocket URL", text: $socket)
-                            .keyboardType(.URL)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        SecureField("登録コード", text: $code)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        Button(model.registering ? "登録中…" : "登録") {
+                        if model.pendingEnrollment == nil {
+                            TextField("HTTP API URL", text: $http)
+                                .keyboardType(.URL)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            TextField("WebSocket URL", text: $socket)
+                                .keyboardType(.URL)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            SecureField("登録コード", text: $code)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                        Button(model.registering ? "登録中…" : model.pendingEnrollment == nil ? "登録" : "前回の登録を再試行") {
                             Task {
                                 await model.register(http: http, socket: socket, code: code.trimmingCharacters(in: .whitespacesAndNewlines))
                                 if model.credentials != nil { code = "" }
                             }
                         }
-                        .disabled(http.isEmpty || socket.isEmpty || code.isEmpty || model.registering)
+                        .disabled(model.registering || (model.pendingEnrollment == nil && (http.isEmpty || socket.isEmpty || code.isEmpty)))
+                        if let attempt = model.pendingEnrollment {
+                            LabeledContent("再試行先", value: attempt.httpURL.host ?? "")
+                        }
                     }
                 }
                 if let error = model.error {
