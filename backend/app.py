@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import random
+import re
 import secrets
 import time
 from urllib.parse import unquote_plus
@@ -33,6 +34,12 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+SOURCE = digest(json.dumps([BUCKET, PREFIX]))
+CATALOG = "AUDIO#" + SOURCE
+LOOKUP = "AUDIO_ID#" + SOURCE
+PLAYED = "PLAYED#" + SOURCE
+
+
 def wire(item):
     return {name: serializer.serialize(value) for name, value in item.items()}
 
@@ -56,20 +63,20 @@ def ingest(event, _context):
         object_key = unquote_plus(source["object"]["key"])
         if source["bucket"]["name"] != BUCKET or not object_key.startswith(PREFIX) or not object_key.lower().endswith(".mp3"):
             continue
-        audio_id = digest(BUCKET + "\0" + object_key)
+        audio_id = digest(SOURCE + "\0" + object_key)
         insert_audio(audio_id, object_key, record["eventTime"])
 
 
 def insert_audio(audio_id, object_key, created_at):
     for attempt in range(10):
-        if get("AUDIO_ID", audio_id):
+        if get(LOOKUP, audio_id):
             return
-        counter = get("META", "sequence")
+        counter = get("META", SOURCE)
         previous = int(counter["value"]) if counter else 0
         order = f"{previous + 1:020d}"
-        audio = {**key("AUDIO", order), "audioId": audio_id, "objectKey": object_key, "createdAt": created_at}
+        audio = {**key(CATALOG, order), "audioId": audio_id, "objectKey": object_key, "createdAt": created_at}
         update = {
-            "Key": wire(key("META", "sequence")),
+            "Key": wire(key("META", SOURCE)),
             "UpdateExpression": "SET #v = :next",
             "ConditionExpression": "#v = :previous" if counter else "attribute_not_exists(#v)",
             "ExpressionAttributeNames": {"#v": "value"},
@@ -78,7 +85,7 @@ def insert_audio(audio_id, object_key, created_at):
         try:
             transact(
                 ("Update", update),
-                put({**key("AUDIO_ID", audio_id), "order": order}, "attribute_not_exists(pk)"),
+                put({**key(LOOKUP, audio_id), "order": order}, "attribute_not_exists(pk)"),
                 put(audio, "attribute_not_exists(pk)"),
             )
             return
@@ -111,31 +118,42 @@ def device(event):
 
 def register(event):
     try:
-        code = json.loads(event.get("body") or "{}")["code"]
-        if not isinstance(code, str) or len(code) > 100:
+        body = json.loads(event.get("body") or "{}")
+        code, token = body["code"], body["token"]
+        if not isinstance(code, str) or not 1 <= len(code) <= 100:
+            return response(400)
+        if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{64}", token):
             return response(400)
     except (ValueError, KeyError, TypeError):
         return response(400)
-    token = secrets.token_urlsafe(32)
+    token_hash, code_hash = digest(token), digest(code)
     device_id = secrets.token_hex(16)
+    registration = {
+        **key("AUTH", "device"), "deviceId": device_id,
+        "tokenHash": token_hash, "registrationCodeHash": code_hash,
+    }
     try:
         transact(
             ("Delete", {
                 "Key": wire(key("AUTH", "registration")),
                 "ConditionExpression": "#ttl > :now AND codeHash = :hash",
                 "ExpressionAttributeNames": {"#ttl": "ttl"},
-                "ExpressionAttributeValues": wire({":now": int(time.time()), ":hash": digest(code)}),
+                "ExpressionAttributeValues": wire({":now": int(time.time()), ":hash": code_hash}),
             }),
-            put({**key("AUTH", "device"), "deviceId": device_id, "tokenHash": digest(token)}, "attribute_not_exists(pk)"),
+            put(registration, "attribute_not_exists(pk)"),
         )
     except ClientError as error:
         reasons = error.response.get("CancellationReasons", [])
         if error.response["Error"]["Code"] == "TransactionCanceledException" and any(
             reason.get("Code") == "ConditionalCheckFailed" for reason in reasons
         ):
+            existing = get("AUTH", "device")
+            if (existing and hmac.compare_digest(existing["tokenHash"], token_hash)
+                    and hmac.compare_digest(existing.get("registrationCodeHash", ""), code_hash)):
+                return response(200, {"deviceId": existing["deviceId"]})
             return response(403)
         raise
-    return response(201, {"deviceId": device_id, "token": token})
+    return response(201, {"deviceId": device_id})
 
 
 def http(event, _context):
@@ -147,28 +165,30 @@ def http(event, _context):
         return response(401)
     if route == "GET /v1/audio":
         cursor = (event.get("queryStringParameters") or {}).get("cursor")
-        checkpoint = get("PLAYED", device_id)
+        checkpoint = get(PLAYED, device_id)
         after = checkpoint["order"] if checkpoint else "0" * 20
         if cursor is not None:
-            if len(cursor) != 20 or not cursor.isascii() or not cursor.isdigit():
+            source, _, order = cursor.partition(":")
+            if not re.fullmatch(r"[a-f0-9]{64}", source) or not re.fullmatch(r"[0-9]{20}", order):
                 return response(400)
-            after = max(after, cursor)
-        condition = Key("pk").eq("AUDIO") & Key("sk").gt(after)
+            if source == SOURCE:
+                after = max(after, order)
+        condition = Key("pk").eq(CATALOG) & Key("sk").gt(after)
         page = table.query(KeyConditionExpression=condition, Limit=25, ConsistentRead=True)
         items = [{"audioId": item["audioId"], "createdAt": item["createdAt"]} for item in page["Items"]]
-        result = {"items": items}
+        result = {"sourceId": SOURCE, "items": items}
         if "LastEvaluatedKey" in page:
-            result["nextCursor"] = page["LastEvaluatedKey"]["sk"]
+            result["nextCursor"] = SOURCE + ":" + page["LastEvaluatedKey"]["sk"]
         return response(200, result)
     audio_id = event["pathParameters"]["audioId"]
     if len(audio_id) != 64 or any(char not in "0123456789abcdef" for char in audio_id):
         return response(404)
-    lookup = get("AUDIO_ID", audio_id)
+    lookup = get(LOOKUP, audio_id)
     if not lookup:
         return response(404)
     if route == "PUT /v1/audio/{audioId}/played":
         return acknowledge(device_id, lookup["order"])
-    audio = get("AUDIO", lookup["order"])
+    audio = get(CATALOG, lookup["order"])
     if not audio or not audio["objectKey"].startswith(PREFIX):
         return response(404)
     expires = 60
@@ -179,7 +199,7 @@ def http(event, _context):
 
 
 def acknowledge(device_id, order):
-    checkpoint = get("PLAYED", device_id)
+    checkpoint = get(PLAYED, device_id)
     previous = checkpoint["order"] if checkpoint else "0" * 20
     if order <= previous:
         return response(200)
@@ -187,7 +207,7 @@ def acknowledge(device_id, order):
         return response(409)
     try:
         table.put_item(
-            Item={**key("PLAYED", device_id), "order": order},
+            Item={**key(PLAYED, device_id), "order": order},
             ConditionExpression="attribute_not_exists(pk) OR #order = :previous",
             ExpressionAttributeNames={"#order": "order"},
             ExpressionAttributeValues={":previous": previous},
@@ -195,7 +215,7 @@ def acknowledge(device_id, order):
     except ClientError as error:
         if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
-        updated = get("PLAYED", device_id)
+        updated = get(PLAYED, device_id)
         if not updated or updated["order"] < order:
             return response(409)
     return response(200)
@@ -288,7 +308,8 @@ def connections():
 def deliver(event, _context):
     audio_ids = [
         record["dynamodb"]["NewImage"]["audioId"]["S"]
-        for record in event["Records"] if record["eventName"] == "INSERT"
+        for record in event["Records"]
+        if record["eventName"] == "INSERT" and record["dynamodb"]["Keys"]["pk"]["S"] == CATALOG
     ]
     if not audio_ids:
         return
