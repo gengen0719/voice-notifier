@@ -64,6 +64,13 @@ export class VoiceNotifierStack extends Stack {
       actions: ['s3:GetObject'],
       resources: [bucket.arnForObjects(props.prefix ? props.prefix + '*' : '*.mp3')],
     }));
+    if (!props.prefix) {
+      api.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [bucket.bucketArn],
+        conditions: { StringLike: { 's3:prefix': '*.mp3' } },
+      }));
+    }
     if (props.kmsKeyArn) {
       api.addToRolePolicy(new iam.PolicyStatement({
         actions: ['kms:Decrypt'], resources: [props.kmsKeyArn],

@@ -191,9 +191,17 @@ def http(event, _context):
     audio = get(CATALOG, lookup["order"])
     if not audio or not audio["objectKey"].startswith(PREFIX):
         return response(404)
+    object_key = audio["objectKey"]
+    if PREFIX == "":
+        # The TT-Agent bucket expires objects. An exact-prefix listing can
+        # confirm absence while keeping ListBucket scoped to MP3 prefixes.
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=object_key, MaxKeys=1)
+        if not any(item["Key"] == object_key for item in listing.get("Contents", [])):
+            result = acknowledge(device_id, lookup["order"])
+            return response(410) if result["statusCode"] == 200 else result
     expires = 60
     url = s3.generate_presigned_url(
-        "get_object", Params={"Bucket": BUCKET, "Key": audio["objectKey"]}, ExpiresIn=expires,
+        "get_object", Params={"Bucket": BUCKET, "Key": object_key}, ExpiresIn=expires,
     )
     return response(200, {"url": url, "expiresAt": int(time.time()) + expires})
 

@@ -144,9 +144,15 @@ struct NotifierAPI {
         try JSONDecoder().decode(Page.self, from: await Self.data(request("v1/audio")))
     }
 
-    func download(_ id: String) async throws -> URL {
+    func download(_ id: String) async throws -> URL? {
         let request = request("v1/audio/\(id)/download", method: "POST")
-        let signed = try JSONDecoder().decode(Download.self, from: await Self.data(request))
+        let data: Data
+        do {
+            data = try await Self.data(request)
+        } catch NotifierError.status(410) {
+            return nil
+        }
+        let signed = try JSONDecoder().decode(Download.self, from: data)
         guard signed.url.scheme == "https" else { throw NotifierError.invalidResponse }
         let (file, response) = try await URLSession.shared.download(for: URLRequest(url: signed.url, timeoutInterval: 60))
         do {
@@ -332,7 +338,7 @@ final class NotifierModel: ObservableObject {
             for item in page.items {
                 try Task.checkCancellation()
                 playback = "ダウンロード中"
-                let file = try await api.download(item.audioId)
+                guard let file = try await api.download(item.audioId) else { continue }
                 defer { try? FileManager.default.removeItem(at: file) }
                 playback = "再生中"
                 try await play(file)
