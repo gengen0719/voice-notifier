@@ -4,6 +4,8 @@
 	classes = {};
 	objectVersion = 56;
 	objects = {
+		A10000000000000000000011 = {isa = PBXBuildFile; fileRef = A10000000000000000000012; };
+		A10000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackQueue.swift; sourceTree = "<group>"; };
 		A10000000000000000000001 = {isa = PBXBuildFile; fileRef = A10000000000000000000002; };
 		A10000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceNotifierApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = VoiceNotifier.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -14,7 +16,7 @@
 		};
 		A10000000000000000000005 = {
 			isa = PBXGroup;
-			children = (A10000000000000000000002);
+			children = (A10000000000000000000002, A10000000000000000000012);
 			path = VoiceNotifier;
 			sourceTree = "<group>";
 		};
@@ -27,7 +29,7 @@
 		A10000000000000000000007 = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (A10000000000000000000001);
+			files = (A10000000000000000000001, A10000000000000000000011);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000008 = {

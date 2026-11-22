@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 from getpass import getpass
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -55,7 +56,7 @@ def request(endpoint, path, method="GET", token=None, body=None):
     except HTTPError as error:
         error.close()
         raise
-    except (OSError, ValueError) as error:
+    except (HTTPException, OSError, ValueError) as error:
         raise ClientError("通知 API との通信または応答の読み取りに失敗しました。") from error
 
 
@@ -100,10 +101,24 @@ def play(url):
         with tempfile.TemporaryDirectory(prefix="voice-notifier-") as directory:
             audio = Path(directory) / "voice.mp3"
             with OPENER.open(Request(url), timeout=60) as response, audio.open("wb") as file:
+                if response.status != 200 or (response.length is None and not response.chunked):
+                    raise ClientError("音声のダウンロードが完全か確認できませんでした。")
+                expected = response.length
                 shutil.copyfileobj(response, file)
+                received = file.tell()
+                if expected is not None and received != expected:
+                    raise ClientError("音声のダウンロードが途中で終了しました。")
+                if received == 0:
+                    raise ClientError("ダウンロードした音声が空です。")
+            # mpg123 can exit successfully without decoding any samples.
+            with tempfile.TemporaryFile(dir=directory) as pcm:
+                subprocess.run(["mpg123", "-q", "-s", str(audio)], check=True,
+                               stdout=pcm, stderr=subprocess.DEVNULL)
+                if os.fstat(pcm.fileno()).st_size == 0:
+                    raise ClientError("MP3 から音声をデコードできませんでした。")
             subprocess.run(["mpg123", "-q", str(audio)], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (HTTPException, OSError, subprocess.CalledProcessError) as error:
         if isinstance(error, HTTPError):
             error.close()
         raise ClientError("音声のダウンロードまたは再生に失敗しました。") from error
