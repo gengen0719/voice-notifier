@@ -66,3 +66,32 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
   -configuration Debug -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath /tmp/voice-notifier-simulator-build CODE_SIGNING_ALLOWED=NO build
 ```
+
+## Raspberry Pi で再生する
+
+Raspberry Pi OS 上で、スピーカーに出力する常駐クライアントを使えます。クライアントは既定で 5 秒ごとに HTTP API を確認します。WebSocket URL と AWS 認証情報は Raspberry Pi には不要です。
+
+サーバーが登録できる端末は 1 台です。iPhone から切り替える場合は管理 Lambda の `revoke` で既存端末を失効させ、`issue` で新しいコードを発行してください。
+
+Raspberry Pi 上のリポジトリ直下から実行します。
+
+```sh
+sudo apt install python3 mpg123
+python3 raspberry-pi/client.py register 'https://<CDK の HttpUrl のホスト>'
+python3 raspberry-pi/client.py run
+```
+
+`register` には CDK 出力の `HttpUrl` 全体を指定し、プロンプトに登録コードを入力します。登録の応答が途切れた場合は、同じ URL と登録コードで再度実行できます。再生時は OS の既定の音声出力が使われます。ポーリング間隔を変えるには `run --interval 10` のように指定します。
+
+認証情報と送信待ちの再生完了通知は `${XDG_STATE_HOME:-$HOME/.local/state}/voice-notifier/state.json` に保存します。任意の保存先を使う場合は `--state-dir` をサブコマンドの前に指定し、登録と再生に同じディレクトリを使います。再生完了の送信に失敗した場合、次の音声を再生する前に再送します。
+
+## クライアントの振る舞いテスト
+
+リポジトリ直下で実行します。テストは期限切れ音声のスキップ、順次再生、再生完了通知の再送、再生失敗時の停止を Given／When／Then で検証します。
+
+```sh
+swift test --package-path ios
+python3 -m unittest discover -s raspberry-pi -v
+```
+
+iOS 側はアプリと同じ再生キューを macOS 上で検証します。両クライアントともテスト実行に AWS 接続や音声出力機器は不要です。

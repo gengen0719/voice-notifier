@@ -98,8 +98,6 @@ enum CredentialStore {
 
 struct NotifierAPI {
     struct Device: Decodable { let deviceId: String }
-    struct Audio: Decodable { let audioId: String }
-    struct Page: Decodable { let sourceId: String; let items: [Audio] }
     struct Download: Decodable { let url: URL }
 
     let credentials: Credentials
@@ -140,8 +138,8 @@ struct NotifierAPI {
         guard (200..<300).contains(response.statusCode) else { throw NotifierError.status(response.statusCode) }
     }
 
-    func page() async throws -> Page {
-        try JSONDecoder().decode(Page.self, from: await Self.data(request("v1/audio")))
+    func page() async throws -> AudioPage {
+        try JSONDecoder().decode(AudioPage.self, from: await Self.data(request("v1/audio")))
     }
 
     func download(_ id: String) async throws -> URL? {
@@ -314,42 +312,24 @@ final class NotifierModel: ObservableObject {
     }
 
     private func drain(_ api: NotifierAPI) async throws {
-        let defaults = UserDefaults.standard
-        let legacyKey = pendingKey(api.credentials)
-        let sourcesKey = pendingSourcesKey(api.credentials)
-        while true {
-            try Task.checkCancellation()
-            let page = try await api.page()
-            var pending = defaults.dictionary(forKey: sourcesKey) as? [String: String] ?? [:]
-            if pending[page.sourceId] == nil,
-               let legacy = defaults.string(forKey: legacyKey),
-               legacy == page.items.first?.audioId {
-                pending[page.sourceId] = legacy
-                defaults.set(pending, forKey: sourcesKey)
-                defaults.removeObject(forKey: legacyKey)
-            }
-            if let played = pending[page.sourceId] {
-                try await api.acknowledge(played)
-                pending.removeValue(forKey: page.sourceId)
-                defaults.set(pending, forKey: sourcesKey)
-                continue
-            }
-            guard !page.items.isEmpty else { return }
-            for item in page.items {
-                try Task.checkCancellation()
+        let queue = PlaybackQueue(
+            defaults: .standard,
+            legacyKey: pendingKey(api.credentials),
+            sourcesKey: pendingSourcesKey(api.credentials)
+        )
+        try await queue.drain(
+            page: api.page,
+            playAudio: { audioId in
                 playback = "ダウンロード中"
-                guard let file = try await api.download(item.audioId) else { continue }
+                guard let file = try await api.download(audioId) else { return false }
                 defer { try? FileManager.default.removeItem(at: file) }
                 playback = "再生中"
                 try await play(file)
-                pending[page.sourceId] = item.audioId
-                defaults.set(pending, forKey: sourcesKey)
-                try await api.acknowledge(item.audioId)
-                pending.removeValue(forKey: page.sourceId)
-                defaults.set(pending, forKey: sourcesKey)
-                error = nil
-            }
-        }
+                return true
+            },
+            acknowledge: api.acknowledge,
+            didPlay: { error = nil }
+        )
     }
 
     private func play(_ file: URL) async throws {
