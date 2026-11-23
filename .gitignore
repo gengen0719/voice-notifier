@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 DerivedData/
 xcuserdata/
+
+ios/.build/
